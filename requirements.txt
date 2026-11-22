@@ -1,1 +1,11 @@
-
+fastapi>=0.110
+uvicorn[standard]>=0.27
+httpx>=0.27
+websockets>=12.0
+python-dotenv
+orjson
+playwright>=1.40
+opencv-python
+pytesseract
+numpy
+pywebview>=4.4
