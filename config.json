@@ -1,1 +1,5 @@
-
+{
+  "relay_url": "wss://relay.yourdomain.com/relay",
+  "user_key": "usr_xxxxxxxxxxxxxxxxxxxx",
+  "local_port": 5000
+}
