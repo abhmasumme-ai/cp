@@ -1,5 +1,52 @@
 """
-clicker_custom.py - v6 (single: per-over re-cal | multi: any over) — patched.
+clicker.py - v18 (v17 + post-click pre-warm + multi fast-dedup + fast constants) clickerdualmode delivery over/under
+================================================================================
+Modes:
+  - Single-exact (default):
+        python clicker.py <match_id>
+        want = (over+1, xball|ball)  -- only this exact panel is clicked
+
+  - Multi-candidate:
+        python clicker.py <match_id> multi
+        (or)  CLICKER_MULTI=1 python clicker.py <match_id>
+        raw "3.2" -> click 4-2 OR 4-3
+        raw "3.6" -> click 4-6 OR 5-1   <- over boundary
+        raw "4.1" -> click 5-1 OR 5-2   <- over boundary (next over)
+
+v18 changes over v17:
+  1. Post-click pre-warm: refresh_panel_header() runs immediately after click
+     so the NEXT event hits the cache fast-path (<20ms instead of 60-170ms).
+  2. POST_CLICK_COOLDOWN 0.3 -> 0.1 (pre-warm removes need for long cooldown).
+  3. EVENT_TIMEOUT_SEC 0.05 -> 0.01 (lower idle wake latency).
+  4. Multi-mode fast pre-dedup: if ALL candidates already clicked, skip OCR.
+  5. Idle-refresh skipped when recent WS activity (<1s) to avoid blocking loop.
+
+v17 fixes retained:
+  - Multi-mode panel-level dedup (3.6->4.1 no longer skipped)
+  - Dedup key includes ball/xball
+  - str(m.get("over", "")) -> over=0 works
+  - max_boxes = len(final_targets)
+  - Calibration loop crash-proof
+  - _last_dedup_key cleared on RESET
+  - _recent_clicked stores ACTUAL panel value in BOTH modes
+
+PATched (app-only):
+  - _common.safe_input (never blocks in subprocess mode)
+  - _common.send_watch (proper JSON watch message to relay)
+
+Env:
+  CLICKER_WS_URL         default ws://127.0.0.1:5000/ws
+  CLICKER_WS_TOKEN       optional WS auth token
+  CLICKER_HEADLESS       1 = headless browser
+  CLICKER_DEBUG          1 = verbose
+  CLICKER_NO_IDLE        1 = disable idle cache refresh
+  CLICKER_MULTI          1 = force multi-candidate mode
+  CLICKER_SITE_URL       optional (else prompt)
+  CLICKER_MATCH_URL      optional (else prompt)
+  CLICKER_PROXY_URL      optional proxy URL
+  CLICKER_DEDUP_WINDOW   default 30
+  CLICKER_NO_PROMPT      1 = never prompt (set by clicker_manager)
+  TESSERACT_CMD          custom tesseract path
 """
 import asyncio
 import collections
@@ -19,6 +66,7 @@ import numpy as np
 import cv2
 import pytesseract
 
+# ★ PATCH 1: shared safe_input + send_watch
 try:
     from _common import safe_input, send_watch
 except ImportError:
@@ -40,28 +88,32 @@ PING_SEC = 30
 HEADLESS = os.environ.get("CLICKER_HEADLESS") == "1"
 DEBUG = os.environ.get("CLICKER_DEBUG") == "1"
 NO_IDLE = os.environ.get("CLICKER_NO_IDLE") == "1"
-MULTI_MODE = os.environ.get("CLICKER_MULTI") == "1"
 DEDUP_WINDOW = int(os.environ.get("CLICKER_DEDUP_WINDOW", "30"))
+MULTI_MODE = os.environ.get("CLICKER_MULTI") == "1"   # overridable by CLI
 TESSERACT_CMD = os.environ.get("TESSERACT_CMD") or (
     r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     if os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe") else None
 )
 
-PANEL_CACHE_FRESH_SEC = 0.3
-PANEL_CACHE_FRESH_SEC_MULTI = 1.5
-IDLE_REFRESH_SEC = 0.5
-EVENT_TIMEOUT_SEC = 0.01
-POST_CLICK_COOLDOWN = 0.1
-IDLE_SKIP_WS_RECENT_SEC = 1.0
+# Timing - fastest pipeline settings (v18 tightened)
+CACHE_FRESH_SEC = 0.5
+IDLE_REFRESH_SEC = 0.4
+ANCHOR_TRUST_SEC = 60
+EVENT_TIMEOUT_SEC = 0.01         # v18: was 0.05
+POST_CLICK_COOLDOWN = 0.1        # v18: was 0.3
 EVENT_Q_MAXSIZE = 500
+IDLE_SKIP_WS_RECENT_SEC = 1.0    # v18: skip idle OCR if WS active within 1s
 
+# OCR
+COMPARE_THRESHOLD = 0.70
+CACHE_VERIFY_THRESHOLD = 0.82
+HEADER_CROP_W = 240
 OCR_RESIZE = 3
-OCR_CFG_HEADER = '--oem 1 --psm 7'
-OCR_CFG_HEADER_FALLBACK = '--oem 1 --psm 6'
+OCR_CFG_HEADER = '--oem 1 --psm 6'
+OCR_CFG_HEADER_FALLBACK = '--oem 1 --psm 7'
+OCR_CFG_SETUP = '--oem 1 --psm 6'
 
-MAX_OVER = 60
-MAX_THRESHOLD = 3000
-
+# Viewport
 VIEW_W = 1080
 VIEW_H = 797
 WIN_W = VIEW_W + 100
@@ -72,22 +124,41 @@ ANCHOR_TOP = 400
 ANCHOR_W = 100
 ANCHOR_H = 34
 
-ANCHOR_RECT = None
+# State
+ANCHOR_TEMPLATE = {}
 MAPPED_TARGETS = []
-PANEL_CACHE = {"panels": [], "ts": 0.0}
+CALIBRATED_ANCHOR_POS = None
+last_anchor_pos = None
+_anchor_trust_until = 0.0
 _last_click_at = 0.0
-_recent_deliveries = collections.deque(maxlen=DEDUP_WINDOW)
-_pending_reset = threading.Event()
-_prev_panel_snapshot = None
 
-_single_current_over = None
-_recal_pending = False
+panel_cache = {
+    "over": None, "del": None, "ts": 0.0, "ax": None, "ay": None,
+}
+
+# Dedup state (both modes use _recent_clicked with ACTUAL panel value)
+_recent_clicked = collections.deque(maxlen=DEDUP_WINDOW)
+
+_pending_reset = threading.Event()
+_xball_missing_logged = False
+_last_dedup_key = None      # module-level so RESET can clear it
 
 WS_STATE = {"match_filter": "", "up": False, "msg_count": 0, "last_ts": 0.0}
 event_q = queue.Queue(maxsize=EVENT_Q_MAXSIZE)
 _stop_event = threading.Event()
 
+INTERMEDIATE_PATTERNS = [
+    r'^ball\b.*\b(chalu|start|chalo|shuru|shuro)',
+    r'^ball in ?air', r'^boundary ?check',
+    r'^(third ?umpire|3rd ?umpire)',
+    r'^(confirm(ing)?|checking)', r'^(review|drs)',
+    r'^(batsman|bowler|new ?batter|misfield|dropped|overthrow)',
+]
 
+
+# ============================================================
+#  Utilities
+# ============================================================
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -97,43 +168,313 @@ def dbg(msg):
         print(f"[{time.strftime('%H:%M:%S')}] [DBG] {msg}", flush=True)
 
 
+def is_intermediate(ev):
+    ev_low = ev.lower().strip()
+    return any(re.search(p, ev_low) for p in INTERMEDIATE_PATTERNS)
+
+
+def is_ball_chalu(ev):
+    return bool(re.search(r'^ball\b.*\b(chalu|start|chalo|shuru|shuro)',
+                          ev.lower().strip()))
+
+
 def handle_reset(from_id, to_id):
+    """Called from WS thread. Sets flag only (thread-safe)."""
     _pending_reset.set()
     log(f"[RESET] {from_id} -> {to_id}")
 
 
 def check_pending_reset():
+    """Called from main thread. Clears dedup + dedup key safely."""
+    global _last_dedup_key
     if _pending_reset.is_set():
         _pending_reset.clear()
-        _recent_deliveries.clear()
-        log("[RESET] dedup cleared")
+        _recent_clicked.clear()
+        _last_dedup_key = None
+        log("[RESET] dedup window + dedup key cleared")
 
 
-def classify_event(ev_text):
-    ev = (ev_text or "").lower().strip()
-    if not ev:
-        return None
+# ============================================================
+#  Calibration UI (JS)
+# ============================================================
+SHOW_TARGETS_JS = """
+() => {
+    let box = document.getElementById('__pw_target_guide');
+    if (!box) {
+        box = document.createElement('div');
+        box.id = '__pw_target_guide';
+        box.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:999999;background:rgba(0,0,0,0.2);';
+        document.body.appendChild(box);
+    }
+    box.innerHTML = '';
+    let rowCount = window.__row_count || 3;
+    let baseY = 400, anchorW = 100, anchorH = 34, leftX = 70, rightX = 425, boxW = 220, boxH = 30, rowGap = 3.34;
+    const blueBox = document.createElement('div');
+    blueBox.style.cssText = `position:absolute;left:${leftX}px;top:${baseY}px;width:${anchorW}px;height:${anchorH}px;border:2px solid #00aaff;background:rgba(0,170,255,0.4);box-sizing:border-box;display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;font-size:10px;`;
+    blueBox.textContent = "Anchor";
+    box.appendChild(blueBox);
+    let firstRowY = baseY + anchorH;
+    let finalTargets = [];
+    for (let i = 0; i < rowCount; i++) {
+        let y = firstRowY + i * (boxH + rowGap);
+        const leftBox = document.createElement('div');
+        leftBox.style.cssText = `position:absolute;left:${leftX}px;top:${y}px;width:${boxW}px;height:${boxH}px;border:2px solid red;background:transparent;box-sizing:border-box;`;
+        box.appendChild(leftBox);
+        const rightBox = document.createElement('div');
+        rightBox.style.cssText = `position:absolute;left:${rightX}px;top:${y}px;width:${boxW}px;height:${boxH}px;border:2px solid red;background:transparent;box-sizing:border-box;`;
+        box.appendChild(rightBox);
+        finalTargets.push({side: 'over', x: leftX, y: y, w: boxW, h: boxH});
+        finalTargets.push({side: 'under', x: rightX, y: y, w: boxW, h: boxH});
+    }
+    let btnTop = firstRowY + rowCount * (boxH + rowGap) + 15;
+    const btnContainer = document.createElement('div');
+    btnContainer.style.cssText = `position:absolute;left:${leftX}px;top:${btnTop}px;pointer-events:auto;display:flex;gap:10px;`;
+    const doneBtn = document.createElement('button');
+    doneBtn.textContent = 'DONE';
+    doneBtn.style.cssText = 'padding:10px 30px;font-size:16px;font-weight:bold;background:#00c853;color:white;border:none;border-radius:6px;cursor:pointer;';
+    doneBtn.onclick = () => { window.__pw_final_targets = finalTargets; window.__pw_action = 'done'; };
+    const plusBtn = document.createElement('button');
+    plusBtn.textContent = '+ 3 Rows';
+    plusBtn.style.cssText = 'padding:10px 20px;font-size:16px;font-weight:bold;background:#2196f3;color:white;border:none;border-radius:6px;cursor:pointer;';
+    plusBtn.onclick = () => { window.__row_count = Math.min(9, rowCount + 3); window.__pw_action = 'update'; };
+    const minusBtn = document.createElement('button');
+    minusBtn.textContent = '- 3 Rows';
+    minusBtn.style.cssText = 'padding:10px 20px;font-size:16px;font-weight:bold;background:#ff9800;color:white;border:none;border-radius:6px;cursor:pointer;';
+    minusBtn.onclick = () => { window.__row_count = Math.max(3, rowCount - 3); window.__pw_action = 'update'; };
+    const resetBtn = document.createElement('button');
+    resetBtn.textContent = 'RESET';
+    resetBtn.style.cssText = 'padding:10px 20px;font-size:16px;font-weight:bold;background:#ff3d00;color:white;border:none;border-radius:6px;cursor:pointer;';
+    resetBtn.onclick = () => { window.__pw_action = 'reset'; };
+    btnContainer.appendChild(doneBtn);
+    btnContainer.appendChild(plusBtn);
+    btnContainer.appendChild(minusBtn);
+    btnContainer.appendChild(resetBtn);
+    box.appendChild(btnContainer);
+}
+"""
 
-    if re.match(r'^(wicket|out|w)[.!]*$', ev):
-        return 'wicket'
-    if re.match(r'^(bowled|lbw|caught|c ?& ?b|run ?out|stumped?|hit ?wicket|'
-                r'retired|handled|obstruct)', ev):
-        return 'wicket'
 
-    if re.search(r'\b(no[\s_-]?ball|nb)\b', ev):
-        return 'over'
+# ============================================================
+#  Calibration
+# ============================================================
+def setup_from_done(page, final_targets):
+    global CALIBRATED_ANCHOR_POS, last_anchor_pos, _anchor_trust_until
+    log("Saving anchor and target box text from screen...")
 
-    if re.match(r'^wide\b', ev):
-        if re.search(r'\b(four|six|4|6)\b', ev):
-            return 'over'
-        return None
+    page.evaluate("() => { let b = document.getElementById('__pw_target_guide'); if(b) b.remove(); }")
+    page.wait_for_timeout(1000)
 
-    if re.match(r'^(four|six|4|6)\b', ev):
-        return 'over'
+    raw = page.screenshot(type="png", scale="css")
+    src_img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
 
+    anchor_img = src_img[ANCHOR_TOP:ANCHOR_TOP + ANCHOR_H, ANCHOR_LEFT:ANCHOR_LEFT + ANCHOR_W]
+    ANCHOR_TEMPLATE.update({"img": anchor_img, "w": ANCHOR_W, "h": ANCHOR_H})
+    res = cv2.matchTemplate(src_img, anchor_img, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+    if max_val >= COMPARE_THRESHOLD:
+        CALIBRATED_ANCHOR_POS = max_loc
+        last_anchor_pos = max_loc
+        _anchor_trust_until = time.time() + ANCHOR_TRUST_SEC
+    log(f"   Anchor saved (conf={max_val:.2f})")
+
+    MAPPED_TARGETS.clear()
+    KNOWN_LINES = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]
+    max_boxes = len(final_targets)
+
+    for i, t in enumerate(final_targets[:max_boxes]):
+        x, y, w, h = int(t['x']), int(t['y']), int(t['w']), int(t['h'])
+        side_hint = (t.get('side') or '').lower()
+        crop = src_img[y:y + h, x:x + w]
+        if crop.size == 0:
+            continue
+        crop_r = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        text = pytesseract.image_to_string(crop_r, config=OCR_CFG_SETUP).lower()
+        log(f"      [BOX {i}] side={side_hint or '?'} OCR={text!r}")
+
+        side = side_hint if side_hint in ('over', 'under') else ('over' if i % 2 == 0 else 'under')
+        line = None
+        m_ou = re.search(r'\b(over|under|ovr|undr)\b\s*(\d+\.?\d*)', text)
+        if not m_ou:
+            m_ou = re.search(r'(\d+\.?\d*)\s*\b(over|under|ovr|undr)\b', text)
+        if m_ou:
+            for g in m_ou.groups():
+                if g and re.fullmatch(r'\d+\.?\d*', g):
+                    line = float(g)
+                elif g and g[0] == 'o':
+                    side = 'over'
+                elif g and g[0] == 'u':
+                    side = 'under'
+        if line is None:
+            floats = [float(n) for n in re.findall(r'(\d+\.\d+)', text)]
+            for f in floats:
+                if f in KNOWN_LINES:
+                    line = f
+                    break
+            if line is None and floats:
+                line = floats[0]
+        if line is None:
+            line = KNOWN_LINES[i // 2] if (i // 2) < len(KNOWN_LINES) else 0.5
+
+        MAPPED_TARGETS.append({"side": side, "line": line, "x": x, "y": y, "w": w, "h": h})
+        log(f"      Mapping: {side.upper()} {line}")
+
+    log(f"   Mapped {len(MAPPED_TARGETS)}/{max_boxes} targets")
+
+
+# ============================================================
+#  Target decision
+# ============================================================
+def _has_mapped(side, line):
+    return any(t["side"] == side and abs(t["line"] - line) < 0.01
+               for t in MAPPED_TARGETS)
+
+
+def find_target(side, line):
+    for t in MAPPED_TARGETS:
+        if t["side"] == side and abs(t["line"] - line) < 0.01:
+            return t
     return None
 
 
+def decide_side_line(run, kind):
+    if run == 0:
+        if _has_mapped("under", 0.5):
+            return ("under", 0.5)
+        return (None, None)
+    for ln in [7.5, 6.5, 5.5, 4.5, 3.5, 2.5, 1.5, 0.5]:
+        if ln < run and _has_mapped("over", ln):
+            return ("over", ln)
+    return (None, None)
+
+
+# ============================================================
+#  Anchor detection
+# ============================================================
+def find_anchor_fast(page):
+    global CALIBRATED_ANCHOR_POS, last_anchor_pos, _anchor_trust_until
+    now = time.time()
+    cached = CALIBRATED_ANCHOR_POS or last_anchor_pos
+    if cached and now < _anchor_trust_until:
+        return cached
+    if cached:
+        ax, ay = cached
+        if 0 <= ax <= VIEW_W - ANCHOR_W and 0 <= ay <= VIEW_H - ANCHOR_H:
+            try:
+                raw = page.screenshot(
+                    clip={"x": ax, "y": ay, "width": ANCHOR_W, "height": ANCHOR_H},
+                    type="png", scale="css")
+                crop = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
+                if crop is not None and crop.shape == ANCHOR_TEMPLATE["img"].shape:
+                    res = cv2.matchTemplate(crop, ANCHOR_TEMPLATE["img"],
+                                            cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, _ = cv2.minMaxLoc(res)
+                    if max_val >= CACHE_VERIFY_THRESHOLD:
+                        _anchor_trust_until = now + ANCHOR_TRUST_SEC
+                        return ax, ay
+            except Exception:
+                pass
+    try:
+        raw = page.screenshot(type="png", scale="css")
+        src_img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
+        res = cv2.matchTemplate(src_img, ANCHOR_TEMPLATE["img"], cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        if max_val >= COMPARE_THRESHOLD:
+            CALIBRATED_ANCHOR_POS = max_loc
+            last_anchor_pos = max_loc
+            _anchor_trust_until = now + ANCHOR_TRUST_SEC
+            return max_loc[0], max_loc[1]
+    except Exception:
+        pass
+    return None, None
+
+
+# ============================================================
+#  Panel header OCR
+# ============================================================
+_OCR_DIAG = {"fail_count": 0}
+
+
+def preprocess_ocr(crop):
+    return cv2.resize(crop, None, fx=OCR_RESIZE, fy=OCR_RESIZE,
+                      interpolation=cv2.INTER_CUBIC)
+
+
+def refresh_panel_header(page, ax, ay, probe_x, probe_y, probe_h):
+    if ax is None:
+        return False
+    try:
+        raw = page.screenshot(
+            clip={"x": probe_x, "y": probe_y,
+                  "width": HEADER_CROP_W, "height": probe_h},
+            type="png", scale="css")
+        crop = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
+        if crop is None or crop.size == 0:
+            return False
+        crop_big = preprocess_ocr(crop)
+
+        text = ""
+        for cfg in (OCR_CFG_HEADER, OCR_CFG_HEADER_FALLBACK):
+            try:
+                text = pytesseract.image_to_string(crop_big, config=cfg).lower().strip()
+            except Exception:
+                text = ""
+            if text:
+                break
+
+        if not text and _OCR_DIAG["fail_count"] < 5:
+            _OCR_DIAG["fail_count"] += 1
+            n = _OCR_DIAG["fail_count"]
+            log(f"   [OCR-DIAG #{n}] clip=({probe_x},{probe_y},w={HEADER_CROP_W}) text=''")
+
+        if not text:
+            return False
+
+        m = (re.search(r'(\d+)\D{0,4}over\D{0,8}(\d+)\D{0,4}del', text) or
+             re.search(r'(\d+)\D{0,4}over\D{0,8}(\d+)\D{0,4}de[l1]', text) or
+             re.search(r'(\d+)\D{0,4}ov[er]{1,2}\D{0,8}(\d+)\D{0,4}d[e1]', text))
+        if not m:
+            if DEBUG:
+                dbg(f"OCR no-match: {text!r}")
+            return False
+
+        po = int(m.group(1))
+        pd = int(m.group(2))
+        if not (0 <= po <= 50 and 1 <= pd <= 50):
+            return False
+
+        old = (panel_cache["over"], panel_cache["del"])
+        panel_cache["over"] = po
+        panel_cache["del"] = pd
+        panel_cache["ts"] = time.time()
+        panel_cache["ax"] = ax
+        panel_cache["ay"] = ay
+        if DEBUG and old != (po, pd):
+            dbg(f"cache {old}->({po},{pd})")
+        return True
+    except Exception as e:
+        dbg(f"OCR err: {e}")
+        return False
+
+
+# ============================================================
+#  Click action
+# ============================================================
+def do_click(page, target_box, ax, ay):
+    x = ax + (target_box["x"] - ANCHOR_LEFT)
+    y = ay + (target_box["y"] - ANCHOR_TOP)
+    cx = x + target_box["w"] / 2
+    cy = y + target_box["h"] / 2
+    try:
+        page.mouse.click(cx, cy, delay=random.randint(2, 4))
+    except Exception as e:
+        log(f"   Click error: {e}")
+        return None, None
+    return cx, cy
+
+
+# ============================================================
+#  Over/ball parsing
+# ============================================================
 def parse_over_ball(d):
     ov = d.get("over")
     if ov is None:
@@ -153,6 +494,9 @@ def parse_over_ball(d):
             except (ValueError, TypeError):
                 over_dec = 0
                 ball = 1
+        else:
+            over_dec = 0
+            ball = 1
     else:
         ov_str = str(ov).strip()
         try:
@@ -185,306 +529,183 @@ def parse_over_ball(d):
     return over_num, over_dec, ball, xball
 
 
-def _ocr_region(page, x, y, w, h, cfg):
-    try:
-        raw = page.screenshot(
-            clip={"x": x, "y": y, "width": w, "height": h},
-            type="png", scale="css")
-        crop = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
-        if crop is None or crop.size == 0:
-            return ""
-        crop_big = cv2.resize(crop, None, fx=OCR_RESIZE, fy=OCR_RESIZE,
-                              interpolation=cv2.INTER_CUBIC)
-        for c in (cfg, OCR_CFG_HEADER_FALLBACK):
-            try:
-                t = pytesseract.image_to_string(crop_big, config=c).lower().strip()
-            except Exception:
-                t = ""
-            if t:
-                return t
-    except Exception as e:
-        dbg(f"OCR err: {e}")
-    return ""
+# ============================================================
+#  Want candidates (used by BOTH modes)
+#  - cands[0] == single-exact want
+#  - cands[0..1] == multi-candidate
+# ============================================================
+def compute_want_candidates(over_num, over_dec, ball, xball):
+    global _xball_missing_logged
+
+    base_over = over_num + 1
+
+    if xball is not None and xball > 0:
+        delivery = xball
+    else:
+        delivery = ball
+        if xball is None and not _xball_missing_logged:
+            _xball_missing_logged = True
+            log("[INFO] Server payload missing 'xball'. Using 'ball' fallback. "
+                "Fix: add 'xball': d.get('xball') to ball_event output in main.py.")
+
+    if over_dec >= 6:
+        cands = [(base_over, delivery), (base_over + 1, 1)]
+    else:
+        cands = [(base_over, delivery), (base_over, delivery + 1)]
+
+    out = []
+    seen = set()
+    for c in cands:
+        if c in seen:
+            continue
+        if 0 <= c[0] <= 50 and 1 <= c[1] <= 50:
+            seen.add(c)
+            out.append(c)
+    return out
 
 
-def parse_panel_text(text):
-    if not text:
-        return None
-    t = re.sub(r'\s+', ' ', text).strip().lower()
-
-    SIDE_RX = r'\b(u[nm]d[ea]r|ov[ea]r|undr|ovr)\b'
-    OVER_RX = r'[o0]v[ea]?r\b'
-
-    for pat in (
-        rf'(\d+)(?:\.\d+)?\s*{OVER_RX}\D{{0,50}}?{SIDE_RX}\D{{0,10}}?(\d+)',
-        rf'{OVER_RX}\s*(\d+)(?:\.\d+)?\D{{0,50}}?{SIDE_RX}\D{{0,10}}?(\d+)',
-    ):
-        m = re.search(pat, t)
-        if m:
-            try:
-                over_num = int(m.group(1))
-                side_word = m.group(2)
-                threshold = int(m.group(3))
-                side = 'under' if side_word[0] == 'u' else 'over'
-                if 0 <= over_num <= MAX_OVER and 1 <= threshold <= MAX_THRESHOLD:
-                    return {'over': over_num, 'side': side, 'threshold': threshold}
-            except (ValueError, TypeError):
-                pass
-
-    m = re.search(
-        rf'{SIDE_RX}\D{{0,10}}?(\d+)\D{{0,50}}?(\d+)(?:\.\d+)?\s*{OVER_RX}', t)
-    if m:
-        try:
-            side_word = m.group(1)
-            threshold = int(m.group(2))
-            over_num = int(m.group(3))
-            side = 'under' if side_word[0] == 'u' else 'over'
-            if 0 <= over_num <= MAX_OVER and 1 <= threshold <= MAX_THRESHOLD:
-                return {'over': over_num, 'side': side, 'threshold': threshold}
-        except (ValueError, TypeError):
-            pass
-
-    return None
-
-
-def ocr_anchor_text(page):
-    if not ANCHOR_RECT:
-        return ""
-    return _ocr_region(page, ANCHOR_RECT['x'], ANCHOR_RECT['y'],
-                       ANCHOR_RECT['w'], ANCHOR_RECT['h'], OCR_CFG_HEADER)
-
-
-def refresh_panels(page):
-    global _prev_panel_snapshot
-    if not ANCHOR_RECT or not MAPPED_TARGETS:
-        return []
-    t0 = time.perf_counter()
-    panels = []
-    ax = ANCHOR_RECT['x']
-    ay = ANCHOR_RECT['y']
-    for idx, t in enumerate(MAPPED_TARGETS):
-        px = ax + (t['x'] - ANCHOR_LEFT)
-        py = ay + (t['y'] - ANCHOR_TOP)
-        text = _ocr_region(page, px, py, t['w'], t['h'], OCR_CFG_HEADER)
-        info = parse_panel_text(text)
-        if info:
-            info['x'] = t['x']
-            info['y'] = t['y']
-            info['w'] = t['w']
-            info['h'] = t['h']
-            info['idx'] = idx
-            info['raw'] = text[:80]
-            panels.append(info)
-        else:
-            dbg(f"Panel[{idx}] unparsed: {text[:80]!r}")
-
-    PANEL_CACHE['panels'] = panels
-    PANEL_CACHE['ts'] = time.time()
-
-    snap = tuple((p['over'], p['side'], p['threshold']) for p in panels)
-    if snap != _prev_panel_snapshot:
-        log(f"[PANELS] {list(snap)}")
-        _prev_panel_snapshot = snap
-
-    ms = round((time.perf_counter() - t0) * 1000)
-    dbg(f"refresh_panels: {len(panels)}/{len(MAPPED_TARGETS)} in {ms}ms")
-    return panels
-
-
-def get_panels(page):
-    age = time.time() - PANEL_CACHE['ts']
-    ttl = PANEL_CACHE_FRESH_SEC_MULTI if MULTI_MODE else PANEL_CACHE_FRESH_SEC
-    if age < ttl and PANEL_CACHE['panels']:
-        dbg(f"panels from cache (age={age*1000:.0f}ms, ttl={ttl*1000:.0f}ms)")
-        return PANEL_CACHE['panels']
-    return refresh_panels(page)
-
-
-def pick_best_panel_general(panels, ws_over, want_side):
-    matching = [p for p in panels
-                if p['side'] == want_side and p['over'] >= ws_over]
-    if not matching:
-        return None
-    min_over = min(p['over'] for p in matching)
-    candidates = [p for p in matching if p['over'] == min_over]
-    return max(candidates, key=lambda p: p['threshold'])
-
-
-def pick_best_panel_by_side(panels, want_side, reference_over=None):
-    matching = [p for p in panels if p['side'] == want_side]
-    if not matching:
-        return None
-    if reference_over is not None:
-        return min(matching,
-                   key=lambda p: (abs(p['over'] - reference_over),
-                                  -p['threshold']))
-    return max(matching, key=lambda p: p['threshold'])
-
-
-def click_panel(page, panel):
-    cx = ANCHOR_RECT['x'] + (panel['x'] - ANCHOR_LEFT) + panel['w'] / 2
-    cy = ANCHOR_RECT['y'] + (panel['y'] - ANCHOR_TOP) + panel['h'] / 2
-    try:
-        page.mouse.click(cx, cy, delay=random.randint(2, 4))
-        return cx, cy
-    except Exception as e:
-        log(f"   Click error: {e}")
-        return None, None
-
-
-def process_event(page, ev_text, event_type, over_num, over_dec, ball, xball):
+# ============================================================
+#  Event processing (unified single + multi)
+# ============================================================
+def process_event(page, ball_key, run, kind, over_num, over_dec, ball, xball):
     global _last_click_at
 
-    want_side = 'under' if event_type == 'wicket' else 'over'
     t0 = time.perf_counter()
-    panels = get_panels(page)
-    best = None
+    side_want, line_want = decide_side_line(run, kind)
+    all_cands = compute_want_candidates(over_num, over_dec, ball, xball)
 
     if MULTI_MODE:
-        best = pick_best_panel_by_side(panels, want_side,
-                                       reference_over=over_num)
+        cands = all_cands
+        cand_str = " | ".join(f"{o}-{d}" for o, d in cands) if cands else "?"
+        log(f"[TARGET] {ball_key} run={run}({kind}) -> "
+            f"{side_want} {line_want} | want: {cand_str} "
+            f"(over_dec={over_dec} ball={ball})")
     else:
-        best = pick_best_panel_general(panels, over_num, want_side)
+        cands = all_cands[:1]
+        want = cands[0] if cands else None
+        cand_str = f"{want[0]}-{want[1]}" if want else "?"
+        log(f"[TARGET] {ball_key} run={run}({kind}) -> "
+            f"{side_want} {line_want} | want={cand_str}")
 
-    if not best:
-        dbg(f"no {want_side} panel in cache - forcing fresh OCR")
-        panels = refresh_panels(page)
-        if MULTI_MODE:
-            best = pick_best_panel_by_side(panels, want_side,
-                                           reference_over=over_num)
-        else:
-            best = pick_best_panel_general(panels, over_num, want_side)
-
-    if not best:
-        summary = [(p['over'], p['side'], p['threshold']) for p in panels]
-        mode_str = ("MULTI(side-only)" if MULTI_MODE
-                    else f"GENERAL(ws_over={over_num}, panel_over>={over_num})")
-        log(f"[NO-MATCH] {mode_str} type={event_type} "
-            f"want_side={want_side} visible_panels={summary}")
+    if not cands:
+        log(f"[NO-CANDIDATE] over_num={over_num} over_dec={over_dec}")
         return False
 
-    cx, cy = click_panel(page, best)
-    if cx is None:
+    if side_want is None:
+        log(f"[NO-MAPPED-LINE] run={run} - skip")
         return False
+
+    # Single-mode fast pre-dedup: if exact want already clicked, skip entirely.
+    if not MULTI_MODE and cands[0] in _recent_clicked:
+        log(f"[ALREADY-CLICKED] ({cand_str})")
+        return False
+
+    # v18: Multi-mode fast pre-dedup — if ALL candidates already clicked, skip.
+    if MULTI_MODE and all(c in _recent_clicked for c in cands):
+        log(f"[ALREADY-CLICKED-ALL] {cand_str}")
+        return False
+
+    target_box = find_target(side_want, line_want)
+    if not target_box:
+        log(f"[NO-TARGET] {side_want} {line_want}")
+        return False
+
+    def check_and_click(source):
+        """Read current panel; click only if it's in cands AND not already clicked."""
+        global _last_click_at
+        po, pd = panel_cache["over"], panel_cache["del"]
+        if po is None or pd is None:
+            return False
+        if (po, pd) not in cands:
+            return False
+        if (po, pd) in _recent_clicked:
+            log(f"[ALREADY-CLICKED] panel {po}-{pd} (in dedup window)")
+            return False
+        cx, cy = do_click(page, target_box,
+                          panel_cache["ax"], panel_cache["ay"])
+        if cx is None:
+            return False
+        ms = round((time.perf_counter() - t0) * 1000)
+        log(f"[CLICK-{source}] panel={po}-{pd} "
+            f"target={side_want} {line_want} "
+            f"@({cx:.0f},{cy:.0f}) [+{ms}ms]")
+        _recent_clicked.append((po, pd))
+        _last_click_at = time.time()
+        panel_cache["ts"] = 0    # invalidate — panel has advanced
+
+        # v18: post-click pre-warm — re-read panel immediately so the NEXT
+        # event hits the cache fast-path instead of paying full OCR latency.
+        # Best-effort: if it reads stale, the next event's slow path corrects it.
+        try:
+            axw = panel_cache["ax"]
+            ayw = panel_cache["ay"]
+            if axw is not None and ayw is not None:
+                txw = axw + (target_box["x"] - ANCHOR_LEFT)
+                tyw = ayw + (target_box["y"] - ANCHOR_TOP)
+                refresh_panel_header(page, axw, ayw, txw, tyw, target_box["h"])
+        except Exception:
+            pass
+        return True
+
+    # Fast path: cache hit (cache populated by a recent idle-refresh OCR)
+    cache_age = time.time() - panel_cache["ts"]
+    if cache_age < CACHE_FRESH_SEC and panel_cache["ax"] is not None:
+        if check_and_click(f"CACHE age={cache_age*1000:.0f}ms"):
+            return True
+
+    # Slow path: OCR refresh
+    ax, ay = find_anchor_fast(page)
+    if ax is None:
+        log("[NO-ANCHOR]")
+        return False
+
+    tx = ax + (target_box["x"] - ANCHOR_LEFT)
+    ty = ay + (target_box["y"] - ANCHOR_TOP)
+    refresh_panel_header(page, ax, ay, tx, ty, target_box["h"])
+
+    if check_and_click("OCR"):
+        return True
 
     ms = round((time.perf_counter() - t0) * 1000)
-    log(f"[CLICK] {event_type}({want_side}) -> panel over={best['over']} "
-        f"{best['side']} {best['threshold']} @({cx:.0f},{cy:.0f}) [+{ms}ms]")
-
-    _last_click_at = time.time()
-
-    PANEL_CACHE['ts'] = 0
-    try:
-        page.wait_for_timeout(80)
-        refresh_panels(page)
-    except Exception:
-        pass
-
-    return True
+    log(f"[MISS] panel={panel_cache['over']}-{panel_cache['del']} "
+        f"not in {{{cand_str}}} [+{ms}ms]")
+    return False
 
 
-def setup_from_done(page, final_targets):
-    global ANCHOR_RECT, MAPPED_TARGETS
-
-    page.evaluate(
-        "() => { let b = document.getElementById('__pw_target_guide'); if(b) b.remove(); }")
-    page.wait_for_timeout(800)
-
-    ANCHOR_RECT = {'x': ANCHOR_LEFT, 'y': ANCHOR_TOP,
-                   'w': ANCHOR_W, 'h': ANCHOR_H}
-    log(f"   Anchor rect: {ANCHOR_RECT}")
-    at = ocr_anchor_text(page)
-    if at:
-        log(f"   Anchor text: {at!r}")
-
-    MAPPED_TARGETS = []
-    for t in final_targets:
-        MAPPED_TARGETS.append({
-            'x': int(t['x']), 'y': int(t['y']),
-            'w': int(t['w']), 'h': int(t['h']),
-        })
-    log(f"   Saved {len(MAPPED_TARGETS)} panel boxes")
-
-    log("   Initial panel OCR:")
-    panels = refresh_panels(page)
-    for p in panels:
-        log(f"      [{p['idx']}] over={p['over']} {p['side']} "
-            f"{p['threshold']}  raw={p.get('raw','')!r}")
-
-
-SHOW_TARGETS_JS = """
-() => {
-    let box = document.getElementById('__pw_target_guide');
-    if (!box) {
-        box = document.createElement('div');
-        box.id = '__pw_target_guide';
-        box.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:999999;background:rgba(0,0,0,0.2);';
-        document.body.appendChild(box);
-    }
-    box.innerHTML = '';
-    let rowCount = window.__row_count || 1;
-    let baseY = 400, anchorW = 100, anchorH = 34;
-    let leftX = 70, rightX = 425, boxW = 220, boxH = 30, rowGap = 3.34;
-
-    const blueBox = document.createElement('div');
-    blueBox.style.cssText = `position:absolute;left:${leftX}px;top:${baseY}px;width:${anchorW}px;height:${anchorH}px;border:2px solid #00aaff;background:rgba(0,170,255,0.4);box-sizing:border-box;display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;font-size:10px;`;
-    blueBox.textContent = "Anchor";
-    box.appendChild(blueBox);
-
-    let firstRowY = baseY + anchorH;
-    let finalTargets = [];
-    for (let i = 0; i < rowCount; i++) {
-        let y = firstRowY + i * (boxH + rowGap);
-        const leftBox = document.createElement('div');
-        leftBox.style.cssText = `position:absolute;left:${leftX}px;top:${y}px;width:${boxW}px;height:${boxH}px;border:2px solid red;background:transparent;box-sizing:border-box;display:flex;align-items:center;justify-content:center;color:red;font-weight:bold;font-size:9px;`;
-        leftBox.textContent = `R${i+1}L`;
-        box.appendChild(leftBox);
-        const rightBox = document.createElement('div');
-        rightBox.style.cssText = `position:absolute;left:${rightX}px;top:${y}px;width:${boxW}px;height:${boxH}px;border:2px solid red;background:transparent;box-sizing:border-box;display:flex;align-items:center;justify-content:center;color:red;font-weight:bold;font-size:9px;`;
-        rightBox.textContent = `R${i+1}R`;
-        box.appendChild(rightBox);
-        finalTargets.push({x: leftX,  y: y, w: boxW, h: boxH});
-        finalTargets.push({x: rightX, y: y, w: boxW, h: boxH});
-    }
-
-    let btnTop = firstRowY + rowCount * (boxH + rowGap) + 15;
-    const btnContainer = document.createElement('div');
-    btnContainer.style.cssText = `position:absolute;left:${leftX}px;top:${btnTop}px;pointer-events:auto;display:flex;gap:10px;align-items:center;`;
-
-    const doneBtn = document.createElement('button');
-    doneBtn.textContent = 'DONE';
-    doneBtn.style.cssText = 'padding:10px 30px;font-size:16px;font-weight:bold;background:#00c853;color:white;border:none;border-radius:6px;cursor:pointer;';
-    doneBtn.onclick = () => { window.__pw_final_targets = finalTargets; window.__pw_action = 'done'; };
-
-    const plusBtn = document.createElement('button');
-    plusBtn.textContent = '+ 1 Row';
-    plusBtn.style.cssText = 'padding:10px 20px;font-size:16px;font-weight:bold;background:#2196f3;color:white;border:none;border-radius:6px;cursor:pointer;';
-    plusBtn.onclick = () => { window.__row_count = Math.min(9, rowCount + 1); window.__pw_action = 'update'; };
-
-    const minusBtn = document.createElement('button');
-    minusBtn.textContent = '- 1 Row';
-    minusBtn.style.cssText = 'padding:10px 20px;font-size:16px;font-weight:bold;background:#ff9800;color:white;border:none;border-radius:6px;cursor:pointer;';
-    minusBtn.onclick = () => { window.__row_count = Math.max(1, rowCount - 1); window.__pw_action = 'update'; };
-
-    const resetBtn = document.createElement('button');
-    resetBtn.textContent = 'RESET';
-    resetBtn.style.cssText = 'padding:10px 20px;font-size:16px;font-weight:bold;background:#ff3d00;color:white;border:none;border-radius:6px;cursor:pointer;';
-    resetBtn.onclick = () => { window.__pw_action = 'reset'; };
-
-    const info = document.createElement('span');
-    info.style.cssText = 'color:white;font-size:13px;padding:0 10px;';
-    info.textContent = `Rows: ${rowCount}  (default: 1 row × 2 columns)`;
-
-    btnContainer.appendChild(doneBtn);
-    btnContainer.appendChild(plusBtn);
-    btnContainer.appendChild(minusBtn);
-    btnContainer.appendChild(resetBtn);
-    btnContainer.appendChild(info);
-    box.appendChild(btnContainer);
-}
-"""
+# ============================================================
+#  Ball classification
+# ============================================================
+def ball_info(d):
+    ev = str(d.get("ev") or "").strip()
+    ev_low = ev.lower()
+    if not ev or is_intermediate(ev):
+        return (ev, "intermediate", 0)
+    if re.match(r'^(wicket|out|w)[.!]*$', ev_low):
+        return (ev, "wicket", 0)
+    if re.match(r'^(bowled|lbw|caught|c ?& ?b|run ?out|stumped?|hit ?wicket|retired|handled|obstruct)', ev_low):
+        return (ev, "wicket", 0)
+    if re.match(r'^(no[\s_-]?ball|nb)\b', ev_low):
+        m = re.search(r'(\d+)', ev_low)
+        return (ev, "noball", int(m.group(1)) + 1 if m else 1)
+    if re.match(r'^wide\b', ev_low):
+        m = re.search(r'(\d+)', ev_low)
+        return (ev, "wide", int(m.group(1)) + 1 if m else 1)
+    if re.match(r'^(six|6)\b', ev_low):
+        return ("6", "six", 6)
+    if re.match(r'^(four|4)\b', ev_low):
+        return ("4", "four", 4)
+    if re.match(r'^(dot|0)\b', ev_low):
+        return ("0", "dot", 0)
+    m = re.match(r'^(\d+)', ev_low)
+    if m:
+        n = int(m.group(1))
+        return (str(n), "run", n)
+    return (ev, "intermediate", 0)
 
 
+# ============================================================
+#  WebSocket client
+# ============================================================
 async def ws_loop():
     while not _stop_event.is_set():
         mf = WS_STATE.get("match_filter") or ""
@@ -493,6 +714,7 @@ async def ws_loop():
                                           compression=None, max_size=None) as ws:
                 WS_STATE["up"] = True
                 log(f"[WS] connected: {WS_URL}")
+                # ★ PATCH 2: JSON watch via shared helper
                 if mf:
                     await send_watch(ws, mf)
 
@@ -518,18 +740,21 @@ async def ws_loop():
                             m = json.loads(raw)
                         except (ValueError, TypeError):
                             continue
+
                         mid_msg = m.get("id")
                         if mf and mid_msg and str(mid_msg) != str(mf):
                             continue
+
                         if m.get("t") == "reset":
                             handle_reset(m.get('from'), m.get('to'))
                             continue
+
                         WS_STATE["msg_count"] += 1
                         WS_STATE["last_ts"] = time.time()
                         try:
                             event_q.put_nowait(m)
                         except queue.Full:
-                            dbg("event_q full")
+                            dbg("event_q full - dropping message")
                 finally:
                     ptask.cancel()
         except asyncio.CancelledError:
@@ -549,17 +774,22 @@ def start_ws_thread():
             asyncio.run(ws_loop())
         except Exception as e:
             log(f"[WS] thread crashed: {e}")
+
     threading.Thread(target=_run, daemon=True).start()
 
 
+# ============================================================
+#  Main
+# ============================================================
 def monitor_and_click():
-    global MULTI_MODE, _single_current_over, _recal_pending
+    global MULTI_MODE, _last_dedup_key
 
     if len(sys.argv) < 2:
-        print("Usage: python clicker_custom.py <match_key> [multi|single]")
+        print("Usage: python clicker.py <match_key> [multi|single]")
         return
     match_filter = sys.argv[1].strip()
 
+    # CLI overrides env
     if len(sys.argv) >= 3:
         arg2 = sys.argv[2].strip().lower()
         if arg2 == "multi":
@@ -572,9 +802,11 @@ def monitor_and_click():
     if TESSERACT_CMD:
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
+    # ★ PATCH 3: safe_input for site URL
     site_url = (os.environ.get("CLICKER_SITE_URL", "").strip()
                 or safe_input("\nSite URL: ", "https://example.com"))
 
+    # ★ PATCH 4: safe_input for proxy
     proxy_config = None
     proxy_url = (os.environ.get("CLICKER_PROXY_URL", "").strip()
                  or safe_input("Proxy URL [Enter to skip]: ", ""))
@@ -616,6 +848,7 @@ def monitor_and_click():
         page = context.new_page()
         page.goto(site_url)
 
+        # ★ PATCH 5: safe_input for match URL
         match_url = (os.environ.get("CLICKER_MATCH_URL", "").strip()
                      or safe_input("Match URL: ", ""))
         if not match_url:
@@ -627,8 +860,8 @@ def monitor_and_click():
 
         print("\n" + "=" * 65)
         print("Go to browser and select 'Quick Events'")
-        print("Blue anchor fixed, red boxes = 1 row × 2 columns by default")
-        print("Use '+1 Row' / '-1 Row' to adjust. Click DONE once.")
+        print("Adjust red boxes below the blue anchor box")
+        print("Click 'DONE' when ready")
         print("=" * 65 + "\n")
 
         while not _stop_event.is_set():
@@ -638,7 +871,7 @@ def monitor_and_click():
             except Exception as e:
                 log(f"Calibration setup error: {e}")
                 break
-            print("Waiting for calibration (DONE / +1 / -1 / RESET)...")
+            print("Waiting for calibration (DONE / + / - / RESET)...")
             action = None
             while not _stop_event.is_set():
                 try:
@@ -658,7 +891,7 @@ def monitor_and_click():
                 break
             elif action == 'reset':
                 try:
-                    page.evaluate("() => { window.__row_count = 1; }")
+                    page.evaluate("() => { window.__row_count = 3; }")
                 except Exception:
                     break
                 continue
@@ -674,21 +907,25 @@ def monitor_and_click():
 
         start_ws_thread()
         log(f"[WS] waiting... (match_key={match_filter})")
-        log("   Mode: " + ("MULTI (fast, 1.5s cache)" if MULTI_MODE
-                          else "SINGLE/GENERAL (per-over re-cal)"))
+        if MULTI_MODE:
+            log("   Mode: MULTI-candidate")
+            log("   raw 3.2 -> click 4-2 OR 4-3")
+            log("   raw 3.6 -> click 4-6 OR 5-1  (over boundary)")
+            log("   raw 4.1 -> click 5-1 OR 5-2  (over boundary)")
+        else:
+            log("   Mode: SINGLE-exact")
+            log("   want = (over+1, xball|ball) - exact only")
+        log(f"   dedup window {DEDUP_WINDOW}")
+        log(f"   cache fresh <{CACHE_FRESH_SEC*1000:.0f}ms")
+        log(f"   idle refresh every {IDLE_REFRESH_SEC*1000:.0f}ms"
+            f"{' [DISABLED]' if NO_IDLE else ''}")
+        log(f"   post-click cooldown {POST_CLICK_COOLDOWN*1000:.0f}ms\n")
 
-        _single_current_over = None
-        _recal_pending = False
+        _last_dedup_key = None
 
         try:
             while not _stop_event.is_set():
                 check_pending_reset()
-
-                if not MULTI_MODE and _recal_pending:
-                    log("[SINGLE] Pending re-calibration (6 balls done)")
-                    _recal_pending = False
-                    _single_current_over = None
-                    continue
 
                 try:
                     m = event_q.get(timeout=EVENT_TIMEOUT_SEC)
@@ -699,14 +936,19 @@ def monitor_and_click():
                         continue
                     if time.time() - _last_click_at < POST_CLICK_COOLDOWN:
                         continue
+                    # v18: skip idle OCR if recent WS activity (avoid blocking
+                    # the main loop right after events were just processed).
                     if time.time() - WS_STATE["last_ts"] < IDLE_SKIP_WS_RECENT_SEC:
                         continue
-                    if time.time() - PANEL_CACHE['ts'] < IDLE_REFRESH_SEC:
+                    age = time.time() - panel_cache["ts"]
+                    if age < IDLE_REFRESH_SEC:
                         continue
-                    try:
-                        refresh_panels(page)
-                    except Exception:
-                        pass
+                    box = MAPPED_TARGETS[0]
+                    ax, ay = find_anchor_fast(page)
+                    if ax is not None:
+                        px = ax + (box["x"] - ANCHOR_LEFT)
+                        py = ay + (box["y"] - ANCHOR_TOP)
+                        refresh_panel_header(page, ax, ay, px, py, box["h"])
                     continue
 
                 if m.get("t") != "ev":
@@ -715,11 +957,24 @@ def monitor_and_click():
                 ev = str(m.get("ev") or "").strip()
                 if not ev:
                     continue
+                if is_ball_chalu(ev):
+                    _last_dedup_key = None
+                    continue
 
+                # dedup key includes ball/xball; safe over stringify
                 over_str = str(m.get("over", ""))
                 bkey = m.get("xball") or m.get("ball") or ""
+                dedup_key = f"{over_str}|{bkey}|{ev}"
+                if dedup_key == _last_dedup_key:
+                    log(f"[DUP] {dedup_key}")
+                    continue
+                _last_dedup_key = dedup_key
 
-                over_num, over_dec, ball, xball = parse_over_ball(m)
+                text, kind, run = ball_info(m)
+                if kind == "intermediate":
+                    continue
+
+                over_num, over_dec, main_ball, xball = parse_over_ball(m)
                 if over_num is None:
                     continue
 
@@ -727,59 +982,16 @@ def monitor_and_click():
                 srv_ts = m.get("_server_ts")
                 if srv_ts:
                     lag_str = f" | lag={round(time.time()*1000 - srv_ts, 1)}ms"
+
                 xb_str = f" xball={xball}" if xball is not None else ""
+                log(f"[EV] ev={text} kind={kind} run={run} | "
+                    f"over={m.get('over')} over_dec={over_dec} "
+                    f"ball={m.get('ball')}{xb_str}{lag_str}")
 
-                event_type = classify_event(ev)
-
-                if (not MULTI_MODE and _single_current_over is not None
-                        and over_num > _single_current_over):
-                    log(f"[SINGLE] Over changed: {_single_current_over} -> {over_num}")
-                    _recent_deliveries.clear()
-                    _single_current_over = None
-
-                if not MULTI_MODE and PANEL_CACHE.get('panels'):
-                    min_po = min(p['over'] for p in PANEL_CACHE['panels'])
-                    if over_num < min_po:
-                        log(f"[SINGLE] Stale event: over {over_num} < "
-                            f"panel over {min_po}, skip")
-                        continue
-
-                if event_type is None:
-                    log(f"[EV] ev={ev} | over={m.get('over')} "
-                        f"ball={m.get('ball')}{xb_str}{lag_str} -> skip")
-                    if not MULTI_MODE:
-                        if _single_current_over is None:
-                            _single_current_over = over_num
-                        eff = xball if xball is not None else ball
-                        if eff and eff >= 6:
-                            log(f"[SINGLE] Over {over_num} ball {eff} "
-                                f"-> 6 balls done, will re-cal")
-                            _recal_pending = True
-                    continue
-
-                delivery_key = f"{over_str}|{bkey}"
-                if delivery_key in _recent_deliveries:
-                    log(f"[DUP] delivery={delivery_key} ev={ev}")
-                    continue
-                _recent_deliveries.append(delivery_key)
-
-                log(f"[EV] ev={ev} | over={m.get('over')} over_dec={over_dec} "
-                    f"ball={m.get('ball')}{xb_str}{lag_str} -> {event_type}")
-
-                try:
-                    process_event(page, ev, event_type,
-                                  over_num, over_dec, ball, xball)
-                except Exception as e:
-                    log(f"[ERR] process_event: {type(e).__name__}: {e}")
-
-                if not MULTI_MODE:
-                    if _single_current_over is None:
-                        _single_current_over = over_num
-                    eff = xball if xball is not None else ball
-                    if eff and eff >= 6:
-                        log(f"[SINGLE] Over {over_num} ball {eff} "
-                            f"-> 6 balls done, will re-cal")
-                        _recal_pending = True
+                process_event(
+                    page, f"{over_str}_{ev}",
+                    run, kind, over_num, over_dec, main_ball, xball
+                )
 
         except KeyboardInterrupt:
             print("\nClosing...")
